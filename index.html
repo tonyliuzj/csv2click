@@ -6,9 +6,9 @@
   <title>CSV Column Viewer</title>
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; line-height: 1.4; }
-    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; margin-bottom: 16px; }
     label { font-weight: 600; }
-    select, input[type="file"], button { padding: 8px 10px; font-size: 14px; }
+    select, input[type="file"], input[type="number"], button { padding: 8px 10px; font-size: 14px; }
     #status { color: #444; margin: 8px 0 16px; }
     #list { border: 1px solid #ddd; border-radius: 10px; padding: 12px; max-width: 980px; }
     .item { padding: 10px 8px; border-bottom: 1px solid #eee; word-break: break-word; }
@@ -17,6 +17,7 @@
     a { color: #0b5fff; text-decoration: none; }
     a:hover { text-decoration: underline; }
     .controls { gap: 10px; }
+    .group { display:flex; gap:10px; flex-wrap: wrap; align-items: end; }
   </style>
 </head>
 <body>
@@ -60,6 +61,25 @@
     </div>
   </div>
 
+  <div class="row">
+    <div class="group">
+      <div>
+        <label for="batchSize">Open batch size:</label><br />
+        <input id="batchSize" type="number" min="1" max="200" value="10" />
+      </div>
+
+      <div>
+        <label>&nbsp;</label><br />
+        <button id="openNextBtn" disabled>Open next links</button>
+      </div>
+
+      <div>
+        <label>&nbsp;</label><br />
+        <button id="resetOpenBtn" disabled>Reset opening to start</button>
+      </div>
+    </div>
+  </div>
+
   <div id="status" class="muted">Choose a CSV to begin.</div>
   <div id="list" aria-live="polite"></div>
 
@@ -73,7 +93,16 @@
   const statusEl = document.getElementById('status');
   const listEl = document.getElementById('list');
 
+  const batchSizeEl = document.getElementById('batchSize');
+  const openNextBtn = document.getElementById('openNextBtn');
+  const resetOpenBtn = document.getElementById('resetOpenBtn');
+
   let parsed = { headers: [], rows: [] };
+
+  // For "open next" feature:
+  let currentColIdx = null;
+  let linkQueue = [];     // array of urls (in row order) from selected column
+  let openCursor = 0;     // next index in linkQueue to open
 
   fileInput.addEventListener('change', async () => {
     resetUI();
@@ -104,14 +133,21 @@
       setStatus(`Loaded ${file.name}: ${parsed.rows.length} data rows, ${headers.length} columns. Delimiter: ${visibleDelimiter(delim)}.`);
       renderBtn.disabled = false;
       columnSelect.disabled = false;
+
+      // Disable open buttons until a column is rendered/selected
+      openNextBtn.disabled = true;
+      resetOpenBtn.disabled = true;
+
+      // Auto-select first column
       columnSelect.selectedIndex = 0;
+      currentColIdx = Number(columnSelect.value);
+      if (Number.isFinite(currentColIdx)) renderColumn(currentColIdx);
     } catch (e) {
       console.error(e);
       setStatus('Failed to parse CSV. Try a different delimiter or check the file format.');
     }
   });
 
-  // If header/delimiter changes, re-trigger parsing (if a file is already chosen)
   hasHeaderSel.addEventListener('change', () => { if (fileInput.files?.[0]) fileInput.dispatchEvent(new Event('change')); });
   delimiterSel.addEventListener('change', () => { if (fileInput.files?.[0]) fileInput.dispatchEvent(new Event('change')); });
 
@@ -122,9 +158,18 @@
   });
 
   columnSelect.addEventListener('change', () => {
-    // auto-render on change once enabled
     const idx = Number(columnSelect.value);
     if (Number.isFinite(idx)) renderColumn(idx);
+  });
+
+  openNextBtn.addEventListener('click', () => {
+    const n = clampInt(batchSizeEl.value, 1, 200, 10);
+    openNextBatch(n);
+  });
+
+  resetOpenBtn.addEventListener('click', () => {
+    openCursor = 0;
+    setStatus(openStatusLine());
   });
 
   function resetUI() {
@@ -132,6 +177,11 @@
     columnSelect.innerHTML = '<option value="">— Select —</option>';
     columnSelect.disabled = true;
     renderBtn.disabled = true;
+    openNextBtn.disabled = true;
+    resetOpenBtn.disabled = true;
+    linkQueue = [];
+    openCursor = 0;
+    currentColIdx = null;
   }
 
   function setStatus(msg) {
@@ -145,70 +195,118 @@
   }
 
   function renderColumn(colIdx) {
+    currentColIdx = colIdx;
     listEl.innerHTML = '';
+    linkQueue = [];
+    openCursor = 0;
+
     let shown = 0;
+    let nonEmpty = 0;
 
     for (const row of parsed.rows) {
       const raw = (row[colIdx] ?? '').trim();
       if (raw === '') continue;
 
+      nonEmpty++;
+
+      const { node, url } = makeLinkishNodeAndUrl(raw);
+      if (url) linkQueue.push(url);
+
       const div = document.createElement('div');
       div.className = 'item';
-      div.appendChild(makeLinkishNode(raw));
+      div.appendChild(node);
       listEl.appendChild(div);
       shown++;
     }
 
-    setStatus(`Showing ${shown} non-empty values from “${parsed.headers[colIdx] || `Column ${colIdx+1}`}”.`);
+    openNextBtn.disabled = linkQueue.length === 0;
+    resetOpenBtn.disabled = linkQueue.length === 0;
+
     if (shown === 0) {
       listEl.innerHTML = `<div class="item muted">No non-empty values in this column.</div>`;
     }
+
+    setStatus(openStatusLine(nonEmpty));
+  }
+
+  function openStatusLine(nonEmptyOverride) {
+    const colName = (currentColIdx != null)
+      ? (parsed.headers[currentColIdx] || `Column ${currentColIdx+1}`)
+      : '—';
+
+    const nonEmptyText = (typeof nonEmptyOverride === 'number')
+      ? `${nonEmptyOverride} non-empty values. `
+      : '';
+
+    if (linkQueue.length === 0) {
+      return `Showing “${colName}”. ${nonEmptyText}No link-like rows detected to open.`;
+    }
+    return `Showing “${colName}”. ${nonEmptyText}Detected ${linkQueue.length} link-like rows. Next to open: ${openCursor + 1} of ${linkQueue.length}.`;
+  }
+
+  function openNextBatch(batchSize) {
+    if (linkQueue.length === 0) return;
+
+    const start = openCursor;
+    const end = Math.min(openCursor + batchSize, linkQueue.length);
+    if (start >= end) {
+      setStatus(`All detected links have been opened. (Total: ${linkQueue.length})`);
+      return;
+    }
+
+    // Open in new tabs (may be blocked if pop-up settings are strict)
+    for (let i = start; i < end; i++) {
+      window.open(linkQueue[i], '_blank', 'noopener,noreferrer');
+    }
+
+    openCursor = end;
+    setStatus(`Opened ${end - start} tab(s). Next to open: ${openCursor + 1} of ${linkQueue.length}.`);
   }
 
   // --- Link detection / rendering ---
 
-  function makeLinkishNode(value) {
+  function makeLinkishNodeAndUrl(value) {
     // Support markdown-ish [text](url)
     const md = value.match(/^\s*\[([^\]]+)\]\(([^)]+)\)\s*$/);
     if (md) {
       const text = md[1].trim();
-      const url = md[2].trim();
+      const urlRaw = md[2].trim();
+      const url = normalizeUrl(urlRaw);
       const a = document.createElement('a');
-      a.href = normalizeUrl(url);
+      a.href = url;
       a.textContent = text;
       a.target = '_blank';
       a.rel = 'noopener noreferrer';
-      return a;
+      return { node: a, url };
     }
 
     // Email
     if (looksLikeEmail(value)) {
+      const url = `mailto:${value}`;
       const a = document.createElement('a');
-      a.href = `mailto:${value}`;
+      a.href = url;
       a.textContent = value;
-      return a;
+      return { node: a, url };
     }
 
     // URL (with or without scheme)
     if (looksLikeUrl(value)) {
+      const url = normalizeUrl(value);
       const a = document.createElement('a');
-      a.href = normalizeUrl(value);
+      a.href = url;
       a.textContent = value;
       a.target = '_blank';
       a.rel = 'noopener noreferrer';
-      return a;
+      return { node: a, url };
     }
 
     // Fallback: plain text
-    return document.createTextNode(value);
+    return { node: document.createTextNode(value), url: null };
   }
 
   function normalizeUrl(url) {
-    // If it already has a scheme, keep it.
     if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(url)) return url;
-    // Allow bare "www.example.com"
     if (/^www\./i.test(url)) return `https://${url}`;
-    // Allow domain.tld/path
     if (/^[^\s]+\.[a-z]{2,}([\/?#].*)?$/i.test(url)) return `https://${url}`;
     return url;
   }
@@ -218,11 +316,15 @@
   }
 
   function looksLikeUrl(s) {
-    // Has scheme
     if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(s)) return true;
-    // Bare domain-ish or www.
     if (/^www\./i.test(s)) return true;
     return /^[^\s]+\.[a-z]{2,}([\/?#].*)?$/i.test(s);
+  }
+
+  function clampInt(val, min, max, fallback) {
+    const n = Number(val);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(min, Math.min(max, Math.floor(n)));
   }
 
   // --- CSV parsing (handles quotes, commas inside quotes, CRLF, etc.) ---
@@ -234,7 +336,6 @@
     let i = 0;
     let inQuotes = false;
 
-    // Normalize newlines
     text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
     while (i < text.length) {
@@ -242,7 +343,6 @@
 
       if (inQuotes) {
         if (c === '"') {
-          // Double quote escape
           if (text[i + 1] === '"') {
             field += '"';
             i += 2;
@@ -258,11 +358,7 @@
           continue;
         }
       } else {
-        if (c === '"') {
-          inQuotes = true;
-          i++;
-          continue;
-        }
+        if (c === '"') { inQuotes = true; i++; continue; }
 
         if (c === delimiter) {
           row.push(field);
@@ -285,34 +381,23 @@
       }
     }
 
-    // last field
     row.push(field);
-    // last row (avoid adding extra empty trailing row from final newline)
-    if (!(row.length === 1 && row[0] === '' && rows.length > 0)) {
-      rows.push(row);
-    }
+    if (!(row.length === 1 && row[0] === '' && rows.length > 0)) rows.push(row);
 
-    // Trim BOM on first cell if present
-    if (rows[0] && rows[0][0]) {
-      rows[0][0] = rows[0][0].replace(/^\uFEFF/, '');
-    }
+    if (rows[0] && rows[0][0]) rows[0][0] = rows[0][0].replace(/^\uFEFF/, '');
 
-    // Remove completely empty rows
     const filtered = rows.filter(r => r.some(cell => String(cell).trim() !== ''));
     return { rows: filtered };
   }
 
   function sniffDelimiter(text) {
-    // Look at first few lines and count delimiter occurrences outside quotes
     const sample = text.slice(0, 20000).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
     const lines = sample.split('\n').slice(0, 10).filter(Boolean);
     const candidates = [',', ';', '\t', '|'];
 
     const scoreFor = (delim) => {
       let score = 0;
-      for (const line of lines) {
-        score += countDelimOutsideQuotes(line, delim);
-      }
+      for (const line of lines) score += countDelimOutsideQuotes(line, delim);
       return score;
     };
 
