@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>CSV Column Viewer</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; line-height: 1.4; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; }
+    label { font-weight: 600; }
+    select, input[type="file"], button { padding: 8px 10px; font-size: 14px; }
+    #status { color: #444; margin: 8px 0 16px; }
+    #list { border: 1px solid #ddd; border-radius: 10px; padding: 12px; max-width: 980px; }
+    .item { padding: 10px 8px; border-bottom: 1px solid #eee; word-break: break-word; }
+    .item:last-child { border-bottom: none; }
+    .muted { color: #666; font-size: 13px; }
+    a { color: #0b5fff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .controls { gap: 10px; }
+  </style>
+</head>
+<body>
+  <h1>CSV Column Viewer</h1>
+
+  <div class="row controls">
+    <div>
+      <label for="fileInput">CSV file:</label><br />
+      <input id="fileInput" type="file" accept=".csv,text/csv" />
+    </div>
+
+    <div>
+      <label for="columnSelect">Column:</label><br />
+      <select id="columnSelect" disabled>
+        <option value="">— Select a file first —</option>
+      </select>
+    </div>
+
+    <div>
+      <label for="hasHeader">Header row:</label><br />
+      <select id="hasHeader">
+        <option value="true" selected>Yes</option>
+        <option value="false">No</option>
+      </select>
+    </div>
+
+    <div>
+      <label for="delimiter">Delimiter:</label><br />
+      <select id="delimiter">
+        <option value="auto" selected>Auto</option>
+        <option value=",">Comma (,)</option>
+        <option value=";">Semicolon (;)</option>
+        <option value="\t">Tab</option>
+        <option value="|">Pipe (|)</option>
+      </select>
+    </div>
+
+    <div>
+      <label>&nbsp;</label><br />
+      <button id="renderBtn" disabled>Render</button>
+    </div>
+  </div>
+
+  <div id="status" class="muted">Choose a CSV to begin.</div>
+  <div id="list" aria-live="polite"></div>
+
+<script>
+(() => {
+  const fileInput = document.getElementById('fileInput');
+  const columnSelect = document.getElementById('columnSelect');
+  const hasHeaderSel = document.getElementById('hasHeader');
+  const delimiterSel = document.getElementById('delimiter');
+  const renderBtn = document.getElementById('renderBtn');
+  const statusEl = document.getElementById('status');
+  const listEl = document.getElementById('list');
+
+  let parsed = { headers: [], rows: [] };
+
+  fileInput.addEventListener('change', async () => {
+    resetUI();
+    const file = fileInput.files?.[0];
+    if (!file) return;
+
+    const text = await file.text();
+    const delim = delimiterSel.value === 'auto' ? sniffDelimiter(text) : delimiterSel.value;
+    const hasHeader = hasHeaderSel.value === 'true';
+
+    try {
+      parsed = parseCSV(text, delim);
+      if (parsed.rows.length === 0) {
+        setStatus('No rows found in the CSV.');
+        return;
+      }
+
+      const headers = hasHeader ? parsed.rows[0] : makeDefaultHeaders(parsed.rows[0].length);
+      const dataRows = hasHeader ? parsed.rows.slice(1) : parsed.rows;
+
+      // Normalize row lengths
+      const width = headers.length;
+      const normalizedRows = dataRows.map(r => padRow(r, width));
+
+      parsed = { headers, rows: normalizedRows };
+
+      populateColumnSelect(headers);
+      setStatus(`Loaded ${file.name}: ${parsed.rows.length} data rows, ${headers.length} columns. Delimiter: ${visibleDelimiter(delim)}.`);
+      renderBtn.disabled = false;
+      columnSelect.disabled = false;
+      columnSelect.selectedIndex = 0;
+    } catch (e) {
+      console.error(e);
+      setStatus('Failed to parse CSV. Try a different delimiter or check the file format.');
+    }
+  });
+
+  // If header/delimiter changes, re-trigger parsing (if a file is already chosen)
+  hasHeaderSel.addEventListener('change', () => { if (fileInput.files?.[0]) fileInput.dispatchEvent(new Event('change')); });
+  delimiterSel.addEventListener('change', () => { if (fileInput.files?.[0]) fileInput.dispatchEvent(new Event('change')); });
+
+  renderBtn.addEventListener('click', () => {
+    const idx = Number(columnSelect.value);
+    if (!Number.isFinite(idx)) return;
+    renderColumn(idx);
+  });
+
+  columnSelect.addEventListener('change', () => {
+    // auto-render on change once enabled
+    const idx = Number(columnSelect.value);
+    if (Number.isFinite(idx)) renderColumn(idx);
+  });
+
+  function resetUI() {
+    listEl.innerHTML = '';
+    columnSelect.innerHTML = '<option value="">— Select —</option>';
+    columnSelect.disabled = true;
+    renderBtn.disabled = true;
+  }
+
+  function setStatus(msg) {
+    statusEl.textContent = msg;
+  }
+
+  function populateColumnSelect(headers) {
+    columnSelect.innerHTML = headers
+      .map((h, i) => `<option value="${i}">${escapeHtml(h || `Column ${i+1}`)}</option>`)
+      .join('');
+  }
+
+  function renderColumn(colIdx) {
+    listEl.innerHTML = '';
+    let shown = 0;
+
+    for (const row of parsed.rows) {
+      const raw = (row[colIdx] ?? '').trim();
+      if (raw === '') continue;
+
+      const div = document.createElement('div');
+      div.className = 'item';
+      div.appendChild(makeLinkishNode(raw));
+      listEl.appendChild(div);
+      shown++;
+    }
+
+    setStatus(`Showing ${shown} non-empty values from “${parsed.headers[colIdx] || `Column ${colIdx+1}`}”.`);
+    if (shown === 0) {
+      listEl.innerHTML = `<div class="item muted">No non-empty values in this column.</div>`;
+    }
+  }
+
+  // --- Link detection / rendering ---
+
+  function makeLinkishNode(value) {
+    // Support markdown-ish [text](url)
+    const md = value.match(/^\s*\[([^\]]+)\]\(([^)]+)\)\s*$/);
+    if (md) {
+      const text = md[1].trim();
+      const url = md[2].trim();
+      const a = document.createElement('a');
+      a.href = normalizeUrl(url);
+      a.textContent = text;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      return a;
+    }
+
+    // Email
+    if (looksLikeEmail(value)) {
+      const a = document.createElement('a');
+      a.href = `mailto:${value}`;
+      a.textContent = value;
+      return a;
+    }
+
+    // URL (with or without scheme)
+    if (looksLikeUrl(value)) {
+      const a = document.createElement('a');
+      a.href = normalizeUrl(value);
+      a.textContent = value;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      return a;
+    }
+
+    // Fallback: plain text
+    return document.createTextNode(value);
+  }
+
+  function normalizeUrl(url) {
+    // If it already has a scheme, keep it.
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(url)) return url;
+    // Allow bare "www.example.com"
+    if (/^www\./i.test(url)) return `https://${url}`;
+    // Allow domain.tld/path
+    if (/^[^\s]+\.[a-z]{2,}([\/?#].*)?$/i.test(url)) return `https://${url}`;
+    return url;
+  }
+
+  function looksLikeEmail(s) {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+  }
+
+  function looksLikeUrl(s) {
+    // Has scheme
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(s)) return true;
+    // Bare domain-ish or www.
+    if (/^www\./i.test(s)) return true;
+    return /^[^\s]+\.[a-z]{2,}([\/?#].*)?$/i.test(s);
+  }
+
+  // --- CSV parsing (handles quotes, commas inside quotes, CRLF, etc.) ---
+
+  function parseCSV(text, delimiter) {
+    const rows = [];
+    let row = [];
+    let field = '';
+    let i = 0;
+    let inQuotes = false;
+
+    // Normalize newlines
+    text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+    while (i < text.length) {
+      const c = text[i];
+
+      if (inQuotes) {
+        if (c === '"') {
+          // Double quote escape
+          if (text[i + 1] === '"') {
+            field += '"';
+            i += 2;
+            continue;
+          } else {
+            inQuotes = false;
+            i++;
+            continue;
+          }
+        } else {
+          field += c;
+          i++;
+          continue;
+        }
+      } else {
+        if (c === '"') {
+          inQuotes = true;
+          i++;
+          continue;
+        }
+
+        if (c === delimiter) {
+          row.push(field);
+          field = '';
+          i++;
+          continue;
+        }
+
+        if (c === '\n') {
+          row.push(field);
+          rows.push(row);
+          row = [];
+          field = '';
+          i++;
+          continue;
+        }
+
+        field += c;
+        i++;
+      }
+    }
+
+    // last field
+    row.push(field);
+    // last row (avoid adding extra empty trailing row from final newline)
+    if (!(row.length === 1 && row[0] === '' && rows.length > 0)) {
+      rows.push(row);
+    }
+
+    // Trim BOM on first cell if present
+    if (rows[0] && rows[0][0]) {
+      rows[0][0] = rows[0][0].replace(/^\uFEFF/, '');
+    }
+
+    // Remove completely empty rows
+    const filtered = rows.filter(r => r.some(cell => String(cell).trim() !== ''));
+    return { rows: filtered };
+  }
+
+  function sniffDelimiter(text) {
+    // Look at first few lines and count delimiter occurrences outside quotes
+    const sample = text.slice(0, 20000).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    const lines = sample.split('\n').slice(0, 10).filter(Boolean);
+    const candidates = [',', ';', '\t', '|'];
+
+    const scoreFor = (delim) => {
+      let score = 0;
+      for (const line of lines) {
+        score += countDelimOutsideQuotes(line, delim);
+      }
+      return score;
+    };
+
+    let best = ',';
+    let bestScore = -1;
+    for (const c of candidates) {
+      const s = scoreFor(c);
+      if (s > bestScore) { bestScore = s; best = c; }
+    }
+    return bestScore <= 0 ? ',' : best;
+  }
+
+  function countDelimOutsideQuotes(line, delim) {
+    let inQuotes = false;
+    let count = 0;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (inQuotes && line[i + 1] === '"') { i++; continue; }
+        inQuotes = !inQuotes;
+      } else if (!inQuotes && ch === delim) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  function makeDefaultHeaders(n) {
+    return Array.from({ length: n }, (_, i) => `Column ${i + 1}`);
+  }
+
+  function padRow(row, width) {
+    const r = row.slice(0, width);
+    while (r.length < width) r.push('');
+    return r;
+  }
+
+  function escapeHtml(str) {
+    return String(str).replace(/[&<>"']/g, (m) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[m]));
+  }
+
+  function visibleDelimiter(d) {
+    if (d === '\t') return 'Tab';
+    return d;
+  }
+})();
+</script>
+</body>
+</html>
